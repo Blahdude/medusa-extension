@@ -16,6 +16,7 @@ from transformers import AutoTokenizer, AutoConfig
 import os
 from huggingface_hub import hf_hub_download
 import warnings
+from safetensors.torch import load_file as safe_load_file
 
 class MedusaConfig(PretrainedConfig):
     """
@@ -140,7 +141,8 @@ class MedusaModelABC(nn.Module):
         except:
             config = MedusaConfig.from_pretrained(pretrained_model_name_or_path)
             base_model_config = AutoConfig.from_pretrained(config.base_model_name_or_path)
-            base_model_config.medusa_num_heads = 5 # TODO: fix the uploaded config (only include 2 heads)
+            # Respect trained head count from saved MedusaConfig
+            base_model_config.medusa_num_heads = getattr(config, "medusa_num_heads", 3)
             base_model_config.medusa_num_layers = config.medusa_num_layers
             model = super().from_pretrained(
                 config.base_model_name_or_path,
@@ -148,12 +150,21 @@ class MedusaModelABC(nn.Module):
                 **kwargs,
                 config=base_model_config,
             )
-            medusa_head_path = os.path.join(pretrained_model_name_or_path, "medusa_lm_head.pt")
-            if os.path.exists(medusa_head_path):
-                filename = medusa_head_path
+            # Prefer local files; support both safetensors and pt
+            local_safe = os.path.join(pretrained_model_name_or_path, "medusa_lm_head.safetensors")
+            local_pt = os.path.join(pretrained_model_name_or_path, "medusa_lm_head.pt")
+            if os.path.exists(local_safe):
+                medusa_head_state_dict = safe_load_file(local_safe)
+            elif os.path.exists(local_pt):
+                medusa_head_state_dict = torch.load(local_pt, map_location=model.device)
             else:
-                filename = hf_hub_download(pretrained_model_name_or_path, "medusa_lm_head.pt")
-            medusa_head_state_dict = torch.load(filename, map_location=model.device)
+                # Try hub - prefer safetensors first
+                try:
+                    filename = hf_hub_download(pretrained_model_name_or_path, "medusa_lm_head.safetensors")
+                    medusa_head_state_dict = safe_load_file(filename)
+                except Exception:
+                    filename = hf_hub_download(pretrained_model_name_or_path, "medusa_lm_head.pt")
+                    medusa_head_state_dict = torch.load(filename, map_location=model.device)
             model.medusa_head.load_state_dict(medusa_head_state_dict, strict=False)
             return model
         
@@ -215,7 +226,13 @@ class MedusaModelABC(nn.Module):
         medusa_logits = []
         # TODO: Consider parallelizing this loop for efficiency?
         for i in range(self.medusa):
-            medusa_logits.append(self.medusa_head[i](hidden_states))
+            mhidden_states = self.medusa_head[i](hidden_states)
+            # If the head outputs hidden states (legacy), project with base lm_head; otherwise assume logits
+            if mhidden_states.shape[-1] != self.vocab_size:
+                mlogits = self.base_model.lm_head(mhidden_states)
+            else:
+                mlogits = mhidden_states
+            medusa_logits.append(mlogits)
         if output_orig:
             return torch.stack(medusa_logits, dim=0), outputs, orig
         return torch.stack(medusa_logits, dim=0)

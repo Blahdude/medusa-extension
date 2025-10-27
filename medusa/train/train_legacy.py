@@ -43,7 +43,7 @@ IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
 # Customized for training Medusa heads
 class CustomizedTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch: Optional[int] = None):
         """
         Compute the training loss for the model.
 

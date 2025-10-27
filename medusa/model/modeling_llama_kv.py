@@ -22,10 +22,16 @@ from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
-    is_flash_attn_available,
     logging,
     replace_return_docstrings,
 )
+# Some versions of transformers may not expose `is_flash_attn_available`.
+# Fall back to a stub that returns False so training can proceed without flash attention.
+try:
+    from transformers.utils import is_flash_attn_available  # type: ignore
+except Exception:  # pragma: no cover - defensive import for version compatibility
+    def is_flash_attn_available() -> bool:  # type: ignore
+        return False
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 
