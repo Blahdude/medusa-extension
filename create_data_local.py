@@ -1,16 +1,14 @@
+import argparse
 import json
-import math
+import os
+import subprocess
+import sys
+from pathlib import Path
 from typing import List, Dict, Optional
-
-import typer
-from typing_extensions import Annotated
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import tqdm
-
-
-app = typer.Typer()
 
 
 def fix_source(source: List[Dict]) -> List[Dict]:
@@ -25,21 +23,19 @@ def fix_source(source: List[Dict]) -> List[Dict]:
 
 
 def build_prompt(tokenizer: AutoTokenizer, messages: List[Dict]) -> str:
-    # Use chat template if available (Zephyr supports this)
     try:
         prompt: str = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
     except Exception:
-        # Fallback: simple prompt join
-        prompt_parts: List[str] = []
+        parts: List[str] = []
         for m in messages:
             if m["role"] == "user":
-                prompt_parts.append(f"User: {m['content']}\n")
+                parts.append(f"User: {m['content']}\n")
             else:
-                prompt_parts.append(f"Assistant: {m['content']}\n")
-        prompt_parts.append("Assistant:")
-        prompt = "".join(prompt_parts)
+                parts.append(f"Assistant: {m['content']}\n")
+        parts.append("Assistant:")
+        prompt = "".join(parts)
     return prompt
 
 
@@ -55,8 +51,8 @@ def generate_assistant_reply(
 ) -> str:
     prompt = build_prompt(tokenizer, messages)
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    attention_mask = torch.ones_like(input_ids)
 
-    # Ensure pad token id is set to avoid warnings in generation
     pad_token_id = tokenizer.pad_token_id
     if pad_token_id is None:
         pad_token_id = tokenizer.eos_token_id
@@ -70,6 +66,8 @@ def generate_assistant_reply(
             do_sample=do_sample,
             pad_token_id=pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
+            attention_mask=attention_mask,
+            use_cache=True,
         )
 
     new_tokens = generated_ids[0, input_ids.shape[1]:]
@@ -88,7 +86,6 @@ def reconstruct_conversation(
     device: str,
 ) -> List[Dict]:
     conv: List[Dict] = []
-    # The source alternates user/assistant; we only keep user turns and generate assistant turns
     for message in conversation[::2]:
         assert message["role"] == "user"
         conv.append(message)
@@ -106,28 +103,35 @@ def reconstruct_conversation(
     return conv
 
 
-@app.command()
-def main(
-    *,
-    input_filename: Annotated[str, typer.Option("--input-filename")],
-    output_filename: Annotated[str, typer.Option("--output-filename")],
-    model_id: Annotated[str, typer.Option("--model-id")] = "HuggingFaceH4/zephyr-7b-beta",
-    device: Annotated[str, typer.Option("--device")] = "auto",
-    dtype: Annotated[str, typer.Option("--dtype")] = "bfloat16",
-    max_new_tokens: Annotated[int, typer.Option("--max-new-tokens")] = 512,
-    temperature: Annotated[float, typer.Option("--temperature")] = 0.0,
-    top_p: Annotated[float, typer.Option("--top-p")] = 0.95,
-    do_sample: Annotated[bool, typer.Option("--do-sample")] = False,
-    batch_size: Annotated[int, typer.Option("--batch-size")] = 1,
-    trust_remote_code: Annotated[bool, typer.Option("--trust-remote-code")] = True,
-    limit: Annotated[Optional[int], typer.Option("--limit")] = None,
-    # Multi-GPU/model placement
-    device_map: Annotated[str, typer.Option("--device-map")] = "none",  # "none" or "auto"
-    # Sharding to run multiple processes in parallel across GPUs
-    num_shards: Annotated[int, typer.Option("--num-shards")] = 1,
-    shard_id: Annotated[int, typer.Option("--shard-id")] = 0,
-):
+def parse_args():
+    p = argparse.ArgumentParser(description="Create self-distill data (multi-GPU launcher + worker)")
+    # Common
+    p.add_argument("--model-id", required=True, type=str)
+    p.add_argument("--input-filename", required=True, type=str)
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"]) 
+    p.add_argument("--max-new-tokens", type=int, default=256)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--do-sample", action="store_true")
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--device", type=str, default="auto")
+    p.add_argument("--device-map", type=str, default="none")
+    # Worker mode
+    p.add_argument("--output-filename", type=str, help="Worker: output JSON path")
+    p.add_argument("--num-shards", type=int, default=1)
+    p.add_argument("--shard-id", type=int, default=0)
+    # Launch mode
+    p.add_argument("--output-prefix", type=str, help="Launcher: prefix for shard outputs")
+    p.add_argument("--merge-output", type=str, default=None, help="Launcher: merged output path")
+    p.add_argument("--devices", type=str, default=None, help="Launcher: comma-separated GPU ids (default 0..num_shards-1)")
+    p.add_argument("--offline", action="store_true")
+    p.add_argument("--hf-home", type=str, default=None)
+    return p.parse_args()
+
+
+def run_worker(args):
     # Resolve device
+    device = args.device
     if device == "auto":
         if torch.cuda.is_available():
             device = "cuda"
@@ -136,70 +140,132 @@ def main(
         else:
             device = "cpu"
 
-    # Resolve dtype
     dtype_map = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
     }
-    # Coerce dtype for mps to float16 if user left default bfloat16
-    requested_dtype = dtype.lower()
-    if device == "mps" and requested_dtype == "bfloat16":
-        typer.echo("mps does not support bfloat16 well; using float16 instead.")
-        requested_dtype = "float16"
-    torch_dtype = dtype_map.get(requested_dtype, torch.bfloat16)
+    torch_dtype = dtype_map.get(args.dtype.lower(), torch.bfloat16)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False, trust_remote_code=trust_remote_code)
-    # Load model with optional device_map for tensor parallel across multiple GPUs
-    dm = None if device_map == "none" else "auto"
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id, use_fast=False)
+    dm = None if args.device_map == "none" else "auto"
     model = AutoModelForCausalLM.from_pretrained(
-        model_id,
+        args.model_id,
         torch_dtype=torch_dtype,
         device_map=dm,
-        trust_remote_code=trust_remote_code,
     )
-
-    # Move to device if not using device_map auto
     if dm is None:
         model.to(device)
     else:
-        # Re-resolve device to the first parameter's device
         device = str(next(model.parameters()).device)
     model.eval()
 
-    with open(input_filename, "r") as f:
+    with open(args.input_filename, "r") as f:
         input_data = json.loads(f.read())
 
     conversations = [fix_source(source["conversations"]) for source in input_data]
-    if limit is not None:
-        conversations = conversations[:max(0, int(limit))]
+    if args.limit is not None:
+        conversations = conversations[:max(0, int(args.limit))]
+    if args.num_shards > 1:
+        assert 0 <= args.shard_id < args.num_shards, "shard_id must be in [0, num_shards)"
+        conversations = [conv for i, conv in enumerate(conversations) if i % args.num_shards == args.shard_id]
 
-    # Shard conversations if requested
-    if num_shards > 1:
-        assert 0 <= shard_id < num_shards, "shard_id must be in [0, num_shards)"
-        conversations = [conv for i, conv in enumerate(conversations) if i % num_shards == shard_id]
-
-    # Simple sequential processing; batch_size>1 is currently a no-op placeholder
-    # to avoid surprising OOMs on smaller GPUs. We keep the parameter for future use.
     recreated_conversations = []
-
-    for i in tqdm.tqdm(range(0, len(conversations), 1)):
+    bar = tqdm.tqdm(range(0, len(conversations), 1),
+                    position=getattr(args, 'shard_id', 0),
+                    leave=True,
+                    dynamic_ncols=True,
+                    desc=f"shard {getattr(args, 'shard_id', 0)}")
+    for i in bar:
         conv = conversations[i]
         recreated = reconstruct_conversation(
             model,
             tokenizer,
             conv,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=do_sample,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            do_sample=args.do_sample,
             device=device,
         )
         recreated_conversations.append(recreated)
 
-    with open(output_filename, "w") as f:
+    with open(args.output_filename, "w") as f:
         json.dump(recreated_conversations, f, indent=4)
 
 
+def run_launcher(args):
+    # Resolve devices
+    if args.devices:
+        devices = [d.strip() for d in args.devices.split(",") if d.strip()]
+    else:
+        devices = [str(i) for i in range(args.num_shards)]
+    if len(devices) < args.num_shards:
+        raise SystemExit("Provide at least num_shards devices for --devices")
+
+    procs = []
+    for shard_id in range(args.num_shards):
+        out_path = f"{args.output_prefix}{shard_id}.json"
+        cmd = [
+            sys.executable,
+            str(Path(__file__).absolute()),
+            "--model-id", args.model_id,
+            "--input-filename", args.input_filename,
+            "--output-filename", out_path,
+            "--dtype", args.dtype,
+            "--num-shards", str(args.num_shards),
+            "--shard-id", str(shard_id),
+            "--max-new-tokens", str(args.max_new_tokens),
+            "--temperature", str(args.temperature),
+            "--top-p", str(args.top_p),
+        ]
+        if args.do_sample:
+            cmd.append("--do-sample")
+        if args.device != "auto":
+            cmd.extend(["--device", args.device])
+        if args.device_map != "none":
+            cmd.extend(["--device-map", args.device_map])
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = devices[shard_id]
+        if args.offline:
+            env["HF_HUB_OFFLINE"] = "1"
+            env["TRANSFORMERS_OFFLINE"] = "1"
+        if args.hf_home:
+            env["HF_HOME"] = args.hf_home
+            env["TRANSFORMERS_CACHE"] = args.hf_home
+
+        print("Launching:", " ".join(cmd), "on GPU", devices[shard_id])
+        procs.append(subprocess.Popen(cmd, env=env))
+
+    exit_codes = [p.wait() for p in procs]
+    if any(code != 0 for code in exit_codes):
+        raise SystemExit(f"Some shards failed: {exit_codes}")
+
+    if args.merge_output:
+        merged = []
+        for shard_id in range(args.num_shards):
+            shard_file = f"{args.output_prefix}{shard_id}.json"
+            with open(shard_file, "r") as f:
+                merged.extend(json.load(f))
+        with open(args.merge_output, "w") as f:
+            json.dump(merged, f, indent=2)
+        print("Merged", args.num_shards, "files →", args.merge_output, "with", len(merged), "conversations")
+
+
+def main():
+    args = parse_args()
+    # Decide mode
+    if args.output_prefix:
+        if not args.num_shards or args.num_shards < 1:
+            raise SystemExit("--num-shards must be >= 1 for launcher mode")
+        run_launcher(args)
+    else:
+        if not args.output_filename:
+            raise SystemExit("Provide --output-filename for worker mode or --output-prefix for launcher mode")
+        run_worker(args)
+
+
 if __name__ == "__main__":
-    app()
+    main()
+

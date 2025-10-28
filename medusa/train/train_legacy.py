@@ -180,9 +180,47 @@ def preprocess(
     prompts = []
     # # import pdb; pdb.set_trace()
     for i, conversation in enumerate(sources):
-        prompt = tokenizer.apply_chat_template(conversation, tokenize=False)
+        # Accept either ShareGPT schema {"conversations": [{"from": "human|gpt", "value": "..."}, ...]}
+        # or HF-style schema: [{"role": "user|assistant", "content": "..."}, ...]
+        if isinstance(conversation, dict) and "conversations" in conversation:
+            conv_obj = conversation["conversations"]
+        else:
+            conv_obj = conversation
+
+        msgs = []
+        for m in conv_obj:
+            if isinstance(m, dict) and "role" in m and "content" in m:
+                msgs.append(m)
+            elif isinstance(m, dict) and "from" in m and "value" in m:
+                frm = m.get("from")
+                if frm == "human":
+                    role = "user"
+                elif frm == "gpt":
+                    role = "assistant"
+                else:
+                    continue
+                msgs.append({"role": role, "content": m.get("value", "")})
+            else:
+                continue
+
+        # Prefer HF chat template; fallback to FastChat template if missing
+        try:
+            prompt = tokenizer.apply_chat_template(msgs, tokenize=False)
+        except Exception:
+            conv = get_conversation_template(getattr(tokenizer, "name_or_path", ""))
+            # Reset any pre-existing messages
+            try:
+                conv.messages = []
+            except Exception:
+                pass
+            for m in msgs:
+                if m.get("role") == "user":
+                    conv.append_message(conv.roles[0], m.get("content", ""))
+                elif m.get("role") == "assistant":
+                    conv.append_message(conv.roles[1], m.get("content", ""))
+            prompt = conv.get_prompt()
         prompts.append(prompt)
-        conversations.append(conversation)
+        conversations.append(msgs)
 
     # Tokenize conversations
     encoding = tokenizer(
@@ -347,7 +385,16 @@ def train():
 
     # Making sure the tokenizer works before loading the model.
     print(tokenizer(["This is a test", "secondary"], padding=True))
-    print(tokenizer.apply_chat_template([{"role": "user", "content": "This is a test"}]))
+    try:
+        print(tokenizer.apply_chat_template([{"role": "user", "content": "This is a test"}]))
+    except Exception:
+        conv = get_conversation_template(getattr(tokenizer, "name_or_path", ""))
+        try:
+            conv.messages = []
+        except Exception:
+            pass
+        conv.append_message(conv.roles[0], "This is a test")
+        print(conv.get_prompt())
 
     # Load model and tokenizer
     model = transformers.AutoModelForCausalLM.from_pretrained(
