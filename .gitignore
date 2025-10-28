@@ -174,4 +174,4 @@ llm_judge/*.sh
 llm_judge/data/mt_bench_test
 llm_judge/data/mt_bench_test_rs
 data
-medusa/eval/*.sh
+medusa/eval/*.shShareGPT_V4.3_unfiltered_cleaned_split.json
