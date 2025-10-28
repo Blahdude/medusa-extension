@@ -1,0 +1,38 @@
+train_legacy.py
+Trains with Vicuna Weights Frozen (Medusa 1)
+(need to fix output_dir, it usually saves to a different folder name)
+
+python -m medusa.train.train_legacy \
+  --model_name_or_path lmsys/vicuna-7b-v1.3 \
+  --data_path "/home/ocamp/Medusa/ShareGPT_Vicuna_unfiltered/ShareGPT_V4.3_subset.json" \
+  --output_dir "/nfs/turbo/smtd-hwdong/ocamp/medusa_heads_train" \
+  --num_train_epochs 1 \
+  --per_device_train_batch_size 8 \
+  --gradient_accumulation_steps 4 \
+  --learning_rate 1e-3 \
+  --model_max_length 2048 \
+  --bf16 True \
+  --medusa_num_heads 5 \
+  --medusa_num_layers 1
+
+
+compare_throughput.py
+Compares original Vicuna to your new Medusa weights
+
+python -m medusa.eval.compare_throughput \
+  --medusa_model "/nfs/turbo/smtd-hwdong/ocamp/medusa_heads_train_medusa_mlp_vicuna-7b-v1.3_medusa_5_lr_0.001_layers_1" \
+  --base_model_id lmsys/vicuna-7b-v1.3 \
+  --max_new_tokens 256 \
+  --temperature 0.0 \
+  --runs 2 \
+  --dtype bfloat16
+
+
+cli.py
+Inference with new medusa heads on cli.py
+
+python -m medusa.inference.cli \
+  --model "/nfs/turbo/smtd-hwdong/ocamp/medusa_heads_train_medusa_mlp_vicuna-7b-v1.3_medusa_5_lr_0.001_layers_1" \
+  --style simple \
+  --temperature 0.0 \
+  --max-steps 256
